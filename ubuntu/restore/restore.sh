@@ -1,0 +1,91 @@
+cat > ~/restore.sh <<'EOF'
+#!/bin/bash
+set -e
+
+echo "=== Starting MicroK8s ==="
+microk8s start
+microk8s status --wait-ready
+
+echo
+echo "=== Hostname / Node identity ==="
+hostname
+microk8s kubectl get nodes
+
+echo
+echo "=== Removing stale node if present ==="
+if microk8s kubectl get node joach >/dev/null 2>&1; then
+  microk8s kubectl delete node joach || true
+fi
+
+echo
+echo "=== Refresh MLflow MinIO secrets in admin namespace ==="
+CREDS=$(juju run mlflow-server/0 get-minio-credentials)
+
+ACCESS_KEY=$(echo "$CREDS" | awk '/access-key:/ {print $2}')
+SECRET_KEY=$(echo "$CREDS" | awk '/secret-access-key:/ {print $2}')
+
+echo "Access key: $ACCESS_KEY"
+echo "Secret key refreshed."
+
+echo
+echo "=== Patch MLflow artifact secret ==="
+microk8s kubectl patch secret mlflow-server-minio-artifact \
+  -n admin \
+  --type merge \
+  -p "{\"stringData\":{\"AWS_ACCESS_KEY_ID\":\"$ACCESS_KEY\",\"AWS_SECRET_ACCESS_KEY\":\"$SECRET_KEY\",\"accesskey\":\"$ACCESS_KEY\",\"secretkey\":\"$SECRET_KEY\"}}"
+
+echo
+echo "=== Patch KServe S3 secret ==="
+microk8s kubectl patch secret kserve-controller-s3 \
+  -n admin \
+  --type merge \
+  -p "{\"stringData\":{\"AWS_ACCESS_KEY_ID\":\"$ACCESS_KEY\",\"AWS_SECRET_ACCESS_KEY\":\"$SECRET_KEY\",\"accesskey\":\"$ACCESS_KEY\",\"secretkey\":\"$SECRET_KEY\",\"AWS_ENDPOINT_URL\":\"http://mlflow-minio.kubeflow:9000\",\"AWS_REGION\":\"us-east-1\",\"S3_ENDPOINT\":\"http://mlflow-minio.kubeflow:9000\"}}"
+
+echo
+echo "=== Verify Ollama ==="
+
+if ! systemctl is-active --quiet ollama; then
+    echo "Starting Ollama..."
+    sudo systemctl start ollama
+fi
+
+echo "Ollama status:"
+systemctl --no-pager --lines=3 status ollama
+
+echo
+echo "Installed models:"
+ollama list || true
+
+echo
+echo "GPU detected by Ollama:"
+curl -s http://localhost:11434/api/version >/dev/null && \
+echo "✓ Ollama API reachable" || \
+echo "✗ Ollama API not reachable"
+
+echo
+echo "=== Recreate notebook pod to reload secrets ==="
+if microk8s kubectl get pod -n admin testkubgpu1-0 >/dev/null 2>&1; then
+  microk8s kubectl delete pod -n admin testkubgpu1-0
+fi
+
+echo
+echo "=== Health check ==="
+~/kubeflow-healthcheck.sh
+
+echo
+echo "======================================="
+echo " Platform Restore completed"
+echo "======================================="
+
+echo
+echo "Verify:"
+echo "  ✓ Kubeflow UI"
+echo "  ✓ MLflow"
+echo "  ✓ Notebook starts"
+echo "  ✓ ollama list"
+echo "  ✓ import torch"
+echo "  ✓ torch.cuda.is_available()"
+
+EOF
+
+chmod +x ~/restore.sh
