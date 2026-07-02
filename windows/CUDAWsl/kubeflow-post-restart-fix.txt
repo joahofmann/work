@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NS="admin"
+
+echo "Checking MicroK8s..."
+microk8s status --wait-ready >/dev/null
+
+echo "Checking Juju..."
+juju status >/dev/null
+
+echo "Reading current MLflow MinIO credentials..."
+CREDS="$(juju run mlflow-server/0 get-minio-credentials)"
+
+ACCESS_KEY="$(echo "$CREDS" | awk -F': ' '/access-key:/ {print $2}' | tail -1)"
+SECRET_KEY="$(echo "$CREDS" | awk -F': ' '/secret-access-key:/ {print $2}' | tail -1)"
+
+if [[ -z "$ACCESS_KEY" || -z "$SECRET_KEY" ]]; then
+  echo "ERROR: Could not read MLflow MinIO credentials."
+  echo "$CREDS"
+  exit 1
+fi
+
+echo "Current access key: $ACCESS_KEY"
+echo "Patching admin/mlflow-server-minio-artifact..."
+
+microk8s kubectl patch secret mlflow-server-minio-artifact \
+  -n "$NS" \
+  --type merge \
+  -p "{\"stringData\":{\"AWS_ACCESS_KEY_ID\":\"$ACCESS_KEY\",\"AWS_SECRET_ACCESS_KEY\":\"$SECRET_KEY\"}}"
+
+echo "Patching admin/kserve-controller-s3..."
+
+microk8s kubectl patch secret kserve-controller-s3 \
+  -n "$NS" \
+  --type merge \
+  -p "{\"stringData\":{\"AWS_ACCESS_KEY_ID\":\"$ACCESS_KEY\",\"AWS_SECRET_ACCESS_KEY\":\"$SECRET_KEY\"}}"
+
+echo "Verifying..."
+
+MLFLOW_SECRET="$(microk8s kubectl get secret -n "$NS" mlflow-server-minio-artifact \
+  -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)"
+
+KSERVE_SECRET="$(microk8s kubectl get secret -n "$NS" kserve-controller-s3 \
+  -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)"
+
+if [[ "$MLFLOW_SECRET" == "$SECRET_KEY" ]]; then
+  echo "OK: mlflow-server-minio-artifact"
+else
+  echo "ERROR: mlflow-server-minio-artifact mismatch"
+  exit 1
+fi
+
+if [[ "$KSERVE_SECRET" == "$SECRET_KEY" ]]; then
+  echo "OK: kserve-controller-s3"
+else
+  echo "ERROR: kserve-controller-s3 mismatch"
+  exit 1
+fi
+
+echo "Done. Secrets are correct."
+echo "If notebook was already running, restart it with:"
+echo "microk8s kubectl delete pod -n admin testkub2-0"

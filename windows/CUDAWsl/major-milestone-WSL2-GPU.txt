@@ -1,0 +1,442 @@
+I agree—today was a major milestone. We solved two independent problems that were interacting in confusing ways:
+
+1. **Getting GPU support working in WSL2 + Ubuntu + MicroK8s + Kubernetes.**
+2. **Getting Kubeflow Notebooks to actually use that GPU automatically.**
+
+Below is the summary I would keep as the "installation cookbook" for the future.
+
+---
+
+# Part 1 — WSL2 + Ubuntu + MicroK8s GPU
+
+## Initial problem
+
+Everything looked correct:
+
+* Windows NVIDIA driver installed
+* `nvidia-smi` worked inside WSL2
+* `/dev/dxg` existed
+* `/usr/lib/wsl/lib` contained the NVIDIA libraries
+
+But Kubernetes always reported
+
+```
+nvidia.com/gpu: 0
+```
+
+The NVIDIA Device Plugin failed with
+
+```
+Failed to initialize NVML
+ERROR_LIBRARY_NOT_FOUND
+```
+
+or later
+
+```
+Unable to load the NVML library
+```
+
+---
+
+## Step 1 — Verify WSL GPU
+
+```bash
+nvidia-smi
+
+ls -l /dev/dxg
+
+ls -l /usr/lib/wsl/lib/libnvidia-ml.so*
+```
+
+Expected:
+
+* RTX A5000 visible
+* `/dev/dxg`
+* `libnvidia-ml.so.1`
+
+---
+
+## Step 2 — Install NVIDIA Container Toolkit
+
+This turned out to be the missing component.
+
+Add NVIDIA repository
+
+```bash
+sudo apt install -y ca-certificates curl gnupg
+
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+sudo apt update
+```
+
+Install
+
+```bash
+sudo apt install -y nvidia-container-toolkit
+```
+
+Verify
+
+```bash
+which nvidia-container-runtime
+
+which nvidia-ctk
+```
+
+---
+
+## Step 3 — Verify MicroK8s runtime
+
+We discovered
+
+```
+/var/snap/microk8s/current/args/containerd-template.toml
+```
+
+already contained
+
+```
+nvidia-container-runtime
+```
+
+---
+
+## Step 4 — Create RuntimeClass
+
+```yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: nvidia
+handler: nvidia-container-runtime
+```
+
+---
+
+## Step 5 — Patch NVIDIA Device Plugin
+
+Important additions
+
+Mount
+
+```
+/usr/lib/wsl/lib
+```
+
+Mount
+
+```
+/dev/dxg
+```
+
+Environment
+
+```
+LD_LIBRARY_PATH=/usr/lib/wsl/lib
+```
+
+```
+NVIDIA_DRIVER_ROOT=/usr/lib/wsl/lib
+```
+
+RuntimeClass
+
+```
+runtimeClassName: nvidia
+```
+
+---
+
+## Step 6 — Verify Kubernetes
+
+```
+microk8s kubectl describe node joach
+```
+
+Expected
+
+```
+Capacity
+
+nvidia.com/gpu: 1
+
+Allocatable
+
+nvidia.com/gpu: 1
+```
+
+---
+
+## Step 7 — GPU Pod Test
+
+```yaml
+runtimeClassName: nvidia
+
+limits:
+
+nvidia.com/gpu: 1
+```
+
+Run
+
+```
+nvidia-smi
+```
+
+Result
+
+```
+RTX A5000
+CUDA 13.2
+```
+
+---
+
+## Step 8 — PyTorch GPU Test
+
+```
+import torch
+
+torch.cuda.is_available()
+
+torch.cuda.get_device_name(0)
+```
+
+Result
+
+```
+True
+
+RTX A5000
+```
+
+At this point Kubernetes GPU support was fully working.
+
+---
+
+# Part 2 — Kubeflow Notebook GPU
+
+## Initial problem
+
+Notebook requested
+
+```
+nvidia.com/gpu: 1
+```
+
+but
+
+```python
+torch.cuda.is_available()
+```
+
+returned
+
+```
+False
+```
+
+or
+
+```
+Found no NVIDIA driver
+```
+
+---
+
+## Investigation
+
+The notebook pod contained
+
+```
+limits:
+    nvidia.com/gpu: 1
+```
+
+BUT
+
+```
+runtimeClassName
+```
+
+was missing.
+
+Therefore Kubernetes allocated a GPU resource but never started the container using the NVIDIA runtime.
+
+---
+
+## Manual fix
+
+Patch notebook
+
+```
+runtimeClassName: nvidia
+```
+
+Restart notebook
+
+GPU immediately worked.
+
+---
+
+## Permanent fix
+
+Install Kyverno
+
+```bash
+microk8s helm3 repo add kyverno https://kyverno.github.io/kyverno/
+
+microk8s helm3 repo update
+
+microk8s helm3 upgrade -i kyverno kyverno/kyverno \
+  -n kyverno \
+  --create-namespace
+```
+
+---
+
+## Create ClusterPolicy
+
+Automatically mutate every pod requesting
+
+```
+nvidia.com/gpu
+```
+
+by adding
+
+```
+runtimeClassName: nvidia
+```
+
+This solved the notebook problem permanently.
+
+---
+
+## Verification
+
+Create completely new notebook
+
+GPU = 1
+
+No manual patch.
+
+Verify
+
+```bash
+microk8s kubectl get pod \
+-o jsonpath='{.spec.runtimeClassName}'
+```
+
+returns
+
+```
+nvidia
+```
+
+Then inside notebook
+
+```python
+import torch
+
+torch.cuda.is_available()
+
+torch.cuda.get_device_name(0)
+```
+
+Result
+
+```
+True
+
+NVIDIA RTX A5000 Laptop GPU
+```
+
+---
+
+# Remaining limitation
+
+You currently have
+
+```
+1 GPU
+```
+
+Therefore
+
+```
+1 GPU Notebook
+```
+
+or
+
+```
+1 GPU Training Job
+```
+
+can run simultaneously.
+
+A second notebook gives
+
+```
+Insufficient nvidia.com/gpu
+```
+
+This is expected.
+
+---
+
+# Final architecture
+
+```
+Windows 11
+        │
+NVIDIA Driver
+        │
+WSL2
+        │
+Ubuntu
+        │
+NVIDIA Container Toolkit
+        │
+MicroK8s / containerd
+        │
+RuntimeClass (nvidia)
+        │
+NVIDIA Device Plugin
+        │
+Kubernetes
+        │
+Kyverno
+        │
+Automatically adds
+runtimeClassName=nvidia
+        │
+Kubeflow Notebook
+        │
+PyTorch CUDA
+        │
+RTX A5000
+```
+
+## What we achieved
+
+By the end of today, you've built a complete GPU-enabled machine learning platform on WSL2:
+
+* ✅ Windows 11 GPU passthrough to WSL2
+* ✅ Ubuntu with NVIDIA Container Toolkit
+* ✅ MicroK8s exposing the GPU to Kubernetes
+* ✅ NVIDIA Device Plugin registering `nvidia.com/gpu`
+* ✅ Verified GPU access with a standalone CUDA pod
+* ✅ Verified GPU access with a standalone PyTorch pod
+* ✅ Kubeflow Notebook GPU support working
+* ✅ Automatic `runtimeClassName: nvidia` injection for future GPU notebooks using Kyverno
+
+This is a strong foundation. From here, you can focus on ML workflows—Kubeflow Pipelines, MLflow tracking, distributed training, and KServe—without having to revisit the GPU integration.

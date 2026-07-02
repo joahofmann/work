@@ -1,0 +1,255 @@
+joach@joach:~$ history
+    1  sudo nano /etc/wsl.conf
+
+[boot]
+systemd=true
+
+[user]
+default=joach
+
+[network]
+generateHosts=false
+hostname=joach
+
+    2  cat nano /etc/wsl.conf
+    3  cat /etc/hosts
+    4  sudo nano /etc/hosts
+    5  cat /etc/hosts
+    6  exit
+    7  microk8s kubectl port-forward -n kubeflow svc/mlflow 5000:5000
+    8  microk8s kubectl port-forward -n kubeflow svc/mlflow-server 8080:5000
+    9  microk8s kubectl port-forward -n kubeflow svc/istio-ingressgateway-workload 8081:80
+   10  hostname
+   11  hostnamectl
+   12  sudo snap install microk8s --channel=1.32/stable --classic
+   13  sudo usermod -a -G microk8s $USER
+   14  newgrp microk8s
+   15  sudo microk8s enable dns hostpath-storage metallb:10.64.140.43-10.64.140.49 rbac
+   16  microk8s status
+   17  ls
+   18  sudo snap install juju --channel=3.6/stable
+   19  mkdir -p ~/.local/share
+   20  microk8s config | juju add-k8s my-k8s --client
+   21  juju bootstrap my-k8s
+   22  juju add-model kubeflow
+   23  sudo sysctl fs.inotify.max_user_instances=1280
+   24  sudo sysctl fs.inotify.max_user_watches=655360
+   25  sudo nano /etc/sysctl.conf
+   26  cat /etc/sysctl.conf
+   27  juju deploy mlflow --channel=2.22/stable --trust
+   28  juju status
+   29  juju run mlflow-server/0 get-minio-credentials
+   30  microk8s kubectl port-forward -n kubeflow svc/mlflow 5000:5000
+   31  microk8s kubectl get svc -n kubeflow | grep -i mlflow
+   32  history
+   33  juju deploy kubeflow --trust  --channel=1.10/stable
+   34  juju status
+   35  juju config dex-auth static-username=admin
+   36  juju config dex-auth static-password=admin
+   37  juju deploy resource-dispatcher --channel 2.0/stable --trust
+   38  juju integrate mlflow-server:secrets resource-dispatcher:secrets
+   39  juju integrate mlflow-server:pod-defaults resource-dispatcher:pod-defaults
+   40  juju integrate mlflow-minio:object-storage kserve-controller:object-storage
+   41  juju integrate kserve-controller:service-accounts resource-dispatcher:service-accounts
+   42  juju integrate kserve-controller:secrets resource-dispatcher:secrets
+   43  juju integrate mlflow-server:ingress istio-pilot:ingress
+   44  juju integrate mlflow-server:dashboard-links kubeflow-dashboard:links
+   45  microk8s kubectl get svc -n kubeflow | grep -E 'istio|envoy|gateway'
+   46  microk8s kubectl get svc -n kubeflow istio-ingressgateway
+   47  microk8s status
+   48  microk8s enable nvidia
+   49  microk8s kubectl get pods -A -w | grep -i nvidia
+   50  microk8s kubectl get node "$(hostname)"   -o custom-columns=NAME:.metadata.name,GPU-CAPACITY:.status.capacity.nvidia\.com/gpu,GPU-ALLOCATABLE:.status.allocatable.nvidia\.com/gpu
+   51  microk8s status
+   52  nvidia-smi
+   53  microk8s kubectl get pods -A -o wide | grep -Ei 'nvidia|gpu'
+   54  microk8s kubectl get daemonset -A | grep -Ei 'nvidia|gpu'
+   55  microk8s kubectl get events -A --sort-by=.lastTimestamp | grep -Ei 'nvidia|gpu|device.plugin' | tail -50
+   56  microk8s kubectl get clusterpolicy -A
+   57  microk8s kubectl get clusterpolicy -A -o yaml
+   58  microk8s kubectl get pods -n gpu-operator-resources
+   59  microk8s kubectl logs -n gpu-operator-resources deploy/gpu-operator --tail=300
+   60  microk8s kubectl get daemonset -A
+   61  microk8s kubectl get deployment -A
+   62  microk8s kubectl get pods -A | grep -Ei 'nvidia|gpu|device-plugin|container-toolkit|driver|validator'
+   63  microk8s kubectl logs -n gpu-operator-resources deploy/gpu-operator --tail=300
+   64  # 1. Confirm the NVIDIA container runtime/toolkit is installed on the host
+   65  nvidia-ctk --version
+   66  nvidia-container-runtime --version
+   67  # 2. Check whether the GPU Operator created its ClusterPolicy
+   68  microk8s kubectl get clusterpolicy -A
+   69  microk8s kubectl describe clusterpolicy cluster-policy
+   70  # 3. Inspect NFD labels and any GPU-related labels
+   71  microk8s kubectl get node joach --show-labels | tr ',' '\n' | grep -Ei 'nvidia|gpu|feature.node'
+   72  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+   73  curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g'  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+   74  sudo apt update
+   75  sudo apt install -y nvidia-container-toolkit
+   76  nvidia-ctk --version
+   77  nvidia-container-runtime --version
+   78  sudo apt update
+   79  sudo apt install -y runc
+   80  which runc
+   81  runc --version
+   82  nvidia-container-runtime --version
+   83  sudo nvidia-ctk runtime configure   --runtime=containerd   --config=/var/snap/microk8s/current/args/containerd-template.toml
+   84  history
+joach@joach:~$
+
+
+
+
+microk8s kubectl port-forward -n kubeflow svc/mlflow-server 8080:5000
+localhost:8080
+microk8s kubectl port-forward -n kubeflow svc/istio-ingressgateway-workload 8081:80
+localhost:8081
+
+
+
+
+
+That's actually very useful information.
+
+The fact that training now passes strongly suggests we found the root cause:
+
+✅ Kubeflow is fine.
+✅ MLflow is fine.
+❌ After a WSL/MicroK8s restart, Resource Dispatcher recreates the user secrets from the values it has stored, and those values are stale.
+
+So patching the secret works, but it's not the permanent fix.
+
+After every wsl --shutdown (temporary recipe)
+Wait until everything is active:
+juju status
+Check the notebook secret:
+microk8s kubectl get secret -n admin mlflow-server-minio-artifact \
+  -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d; echo
+Get the current MLflow MinIO credentials:
+juju run mlflow-server/0 get-minio-credentials
+If they differ, patch the notebook secret:
+microk8s kubectl patch secret mlflow-server-minio-artifact \
+  -n admin \
+  --type merge \
+  -p '{"stringData":{"AWS_ACCESS_KEY_ID":"minio","AWS_SECRET_ACCESS_KEY":"<CURRENT_SECRET>"}}'
+Restart the notebook:
+microk8s kubectl delete pod -n admin testkub2-0
+The sustainable fix
+
+I don't want to guess at this point because we've narrowed the problem down much further.
+
+The sustainable fix is not patching the admin secret. It is finding where resource-dispatcher gets the old value from and updating that source. Since the admin/mlflow-server-minio-artifact secret has the annotation:
+
+metacontroller.k8s.io/decorator-controller: kubeflow-resource-dispatcher-controller
+
+it is being regenerated from a central template.
+
+The next step is to identify that template (it may be a PodDefault, a manifest generated by the mlflow-server charm, or another Juju-managed resource). Once we update the source, the secret will remain correct across reboots.
+
+
+
+
+
+Congratulations! 🎉 This is a significant milestone. Your complete ML lifecycle is now working on Charmed Kubeflow.
+
+Here's what your pipeline actually used:
+
+Dataset
+    │
+    ▼
+Preprocessing
+    │
+    ▼
+Model Training (scikit-learn)
+    │
+    ▼
+MLflow Tracking Server
+    │
+    ├── metadata → MySQL
+    └── artifacts → MLflow MinIO
+                         │
+                         ▼
+                 model URI
+         s3://mlflow/.../artifacts/model
+                         │
+                         ▼
+KServe
+(storage-initializer downloads the model from MLflow MinIO)
+                         │
+                         ▼
+InferenceService
+                         │
+                         ▼
+Knative + Istio
+                         │
+                         ▼
+REST endpoint
+The components involved
+Component	Purpose
+Kubeflow Pipelines (KFP)	Orchestrates the workflow
+MLflow Server	Tracks experiments and models
+MLflow MySQL	Stores experiment metadata
+MLflow MinIO	Stores model artifacts (s3://mlflow/...)
+KServe	Deploys the trained model
+Knative	Runs the inference service
+Istio	Networking and routing
+Resource Dispatcher	Creates secrets and PodDefaults in user namespaces
+What actually happened
+Train model
+scikit-learn trained the wine regressor.
+Log to MLflow
+Metrics → MLflow MySQL.
+Model → MLflow MinIO.
+
+Returned model URI
+
+s3://mlflow/.../artifacts/model
+Deploy component
+Created a KServe InferenceService.
+KServe downloaded the model from MLflow MinIO.
+Started the predictor.
+Exposed the REST endpoint.
+The three problems we solved today
+1. MLflow MinIO credentials
+
+The notebook secret contained an old password.
+
+✔ Fixed.
+
+2. KServe credentials
+
+The kserve-controller-s3 secret also contained the old password.
+
+✔ Fixed.
+
+3. KServe SDK incompatibility
+
+The tutorial used
+
+constants.KSERVE_KIND
+
+which is incompatible with the installed KServe SDK version.
+
+✔ Fixed by using
+
+kind="InferenceService"
+api_version="serving.kserve.io/v1beta1"
+
+instead.
+
+The remaining thing to fix permanently
+
+The only issue left is persistence across a WSL restart.
+
+The stale secrets came from the Resource Dispatcher, which recreates the user namespace secrets from a central Juju-managed source. Today we patched the generated secrets directly, which got the pipeline working, but after a reboot those generated secrets may revert again if the central source still contains the old credentials.
+
+Finding and correcting that central source is now a much smaller task than before, because the entire MLflow → KServe workflow is proven to work.
+
+This is a major achievement: you now have an end-to-end platform where:
+
+✅ Kubeflow Pipelines orchestrates the workflow.
+✅ MLflow tracks experiments and stores models.
+✅ MinIO stores model artifacts.
+✅ KServe serves the trained model.
+✅ Knative and Istio expose it as a scalable inference service.
+
+That's the complete MLOps flow the tutorial is intended to demonstrate.

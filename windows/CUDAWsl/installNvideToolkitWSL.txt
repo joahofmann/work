@@ -1,0 +1,113 @@
+I’ll turn what we just debugged into a clean rebuild recipe: order of installation, validation points, and the exact Kubernetes/MicroK8s GPU fix before Kubeflow.
+
+Nachgedacht für 7s
+
+Yes. On a fresh install, expect the same issue unless you do GPU setup before Kubeflow.
+
+Use this order:
+
+# 1) In WSL Ubuntu: verify WSL GPU
+nvidia-smi
+ls -l /dev/dxg
+ls -l /usr/lib/wsl/lib/libnvidia-ml.so*
+
+Install NVIDIA Container Toolkit:
+
+sudo apt install -y ca-certificates curl gnupg
+
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+sudo apt update
+sudo apt install -y nvidia-container-toolkit
+
+Install MicroK8s, then device plugin:
+
+sudo snap install microk8s --classic
+sudo usermod -aG microk8s $USER
+newgrp microk8s
+
+microk8s status --wait-ready
+microk8s enable dns storage helm3
+
+Install NVIDIA device plugin:
+
+microk8s helm3 repo add nvdp https://nvidia.github.io/k8s-device-plugin
+microk8s helm3 repo update
+
+microk8s helm3 upgrade -i nvdp nvdp/nvidia-device-plugin \
+  --namespace nvidia-device-plugin \
+  --create-namespace
+
+Create RuntimeClass:
+
+cat <<'EOF' | microk8s kubectl apply -f -
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: nvidia
+handler: nvidia-container-runtime
+EOF
+
+Patch plugin for WSL:
+
+sudo ln -sf /usr/lib/wsl/lib/libnvidia-ml.so.1 /usr/lib/wsl/lib/libnvidia-ml.so
+
+microk8s kubectl -n nvidia-device-plugin set env ds/nvdp-nvidia-device-plugin \
+  LD_LIBRARY_PATH=/usr/lib/wsl/lib \
+  NVIDIA_DRIVER_ROOT=/usr/lib/wsl/lib
+
+Patch mounts:
+
+microk8s kubectl -n nvidia-device-plugin patch ds nvdp-nvidia-device-plugin --type='json' -p='[
+{"op":"add","path":"/spec/template/spec/runtimeClassName","value":"nvidia"},
+{"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"wsl-lib","hostPath":{"path":"/usr/lib/wsl/lib"}}},
+{"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"dxg","hostPath":{"path":"/dev/dxg"}}},
+{"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"wsl-lib","mountPath":"/usr/lib/wsl/lib","readOnly":true}},
+{"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"dxg","mountPath":"/dev/dxg"}}
+]'
+
+Restart and verify:
+
+microk8s kubectl -n nvidia-device-plugin rollout restart ds/nvdp-nvidia-device-plugin
+sleep 8
+
+microk8s kubectl logs -n nvidia-device-plugin \
+  -l app.kubernetes.io/name=nvidia-device-plugin --tail=80
+
+microk8s kubectl describe node $(hostname) | grep -A8 -B3 'nvidia.com/gpu'
+
+Expected:
+
+Registered device plugin for 'nvidia.com/gpu'
+nvidia.com/gpu: 1
+
+Final test:
+
+cat <<'EOF' | microk8s kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-test
+spec:
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  containers:
+  - name: cuda
+    image: nvidia/cuda:12.4.1-base-ubuntu22.04
+    command: ["nvidia-smi"]
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+EOF
+
+microk8s kubectl logs gpu-test
+microk8s kubectl delete pod gpu-test
+
+Only after this works, install Kubeflow/MLflow.
+
+The key rule: do not start Kubeflow until nvidia.com/gpu: 1 appears on the node and the gpu-test pod prints nvidia-smi.

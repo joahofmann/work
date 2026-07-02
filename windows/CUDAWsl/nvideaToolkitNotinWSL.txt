@@ -1,0 +1,229 @@
+This turned out to be a good example of how several individually working pieces can still fail to work together. Here's the full picture.
+
+Initial state
+
+Your environment was:
+
+Windows 11
+WSL2 with Ubuntu 22.04
+NVIDIA RTX A5000 Laptop GPU
+MicroK8s
+Charmed MLflow/Kubeflow
+
+The Windows GPU driver was correctly installed:
+
+nvidia-smi
+
+worked inside WSL.
+
+Even more importantly, this also worked:
+
+microk8s ctr run --gpus 0 ...
+
+which proved that containerd itself could use the GPU.
+
+So the GPU hardware and WSL GPU passthrough were never the problem.
+
+Symptom
+
+Kubernetes never advertised
+
+nvidia.com/gpu
+
+The NVIDIA device plugin always failed with
+
+Failed to initialize NVML:
+ERROR_LIBRARY_NOT_FOUND
+
+Later this changed to
+
+Unable to load the NVML library
+
+meaning we had made progress.
+
+Why this happened
+
+The NVIDIA device plugin is just another Kubernetes pod.
+
+Unlike microk8s ctr, it does not automatically receive
+
+/dev/dxg
+/usr/lib/wsl/lib
+
+from WSL.
+
+Therefore inside the container there was no NVML library.
+
+Without NVML
+
+libnvidia-ml.so
+
+the plugin cannot enumerate GPUs.
+
+Therefore Kubernetes never learns
+
+nvidia.com/gpu
+
+exists.
+
+Step 1
+
+We manually mounted
+
+/dev/dxg
+
+and
+
+/usr/lib/wsl/lib
+
+into the device-plugin DaemonSet.
+
+That changed
+
+Platform: unknown
+
+into
+
+Platform: wsl
+
+This proved the plugin could finally see WSL.
+
+Step 2
+
+The plugin still couldn't load NVML.
+
+We added
+
+LD_LIBRARY_PATH=/usr/lib/wsl/lib
+
+and
+
+NVIDIA_DRIVER_ROOT=/usr/lib/wsl/lib
+
+Now the plugin searched the correct directory.
+
+Step 3
+
+We discovered something much more important.
+
+Your Ubuntu installation did not contain
+
+nvidia-container-runtime
+
+or
+
+nvidia-container-toolkit
+
+Therefore MicroK8s had no NVIDIA runtime available.
+
+That explained why
+
+RuntimeClass
+
+initially failed with
+
+no runtime for "nvidia" is configured
+Step 4
+
+We installed
+
+nvidia-container-toolkit
+
+inside WSL.
+
+Now we had
+
+/usr/bin/nvidia-container-runtime
+/usr/bin/nvidia-ctk
+
+available.
+
+Step 5
+
+MicroK8s already had an NVIDIA runtime configured in
+
+/var/snap/microk8s/current/args/containerd-template.toml
+
+The runtime handler was
+
+nvidia-container-runtime
+
+—not simply nvidia.
+
+This distinction was crucial.
+
+Step 6
+
+We created
+
+RuntimeClass:
+  name: nvidia
+  handler: nvidia-container-runtime
+
+Then configured the device-plugin DaemonSet to use
+
+runtimeClassName: nvidia
+
+Now the plugin itself started under the NVIDIA runtime.
+
+Result
+
+Instead of
+
+Failed to initialize NVML
+
+we finally obtained
+
+Detected platform: wsl
+
+Starting GRPC server for 'nvidia.com/gpu'
+
+Registered device plugin for 'nvidia.com/gpu'
+
+Node capacity became
+
+Capacity
+
+nvidia.com/gpu: 1
+
+Allocatable
+
+nvidia.com/gpu: 1
+Final verification
+
+The GPU test pod
+
+limits:
+  nvidia.com/gpu: 1
+
+ran successfully.
+
+Inside the container
+
+nvidia-smi
+
+reported
+
+NVIDIA RTX A5000 Laptop GPU
+Driver 595.95
+CUDA 13.2
+
+This is the definitive proof that:
+
+Windows → WSL2 GPU passthrough works.
+Ubuntu can access the GPU.
+MicroK8s containerd can inject the GPU.
+Kubernetes schedules GPU workloads correctly.
+The NVIDIA device plugin can advertise the GPU to Kubernetes.
+The key lesson
+
+The root cause was not a single bug, but a chain of missing integration steps:
+
+The device plugin could not initially see WSL's GPU interfaces.
+The WSL NVIDIA libraries needed to be made visible to the plugin.
+The NVIDIA Container Toolkit was not installed in Ubuntu.
+The device plugin itself needed to run with the NVIDIA runtime (nvidia-container-runtime) via a RuntimeClass.
+
+Once all four pieces were in place, your WSL2 + Ubuntu + MicroK8s environment behaved like a native GPU-enabled Kubernetes node.
+
+One final recommendation: save the working configuration (the patched DaemonSet, RuntimeClass, and any MicroK8s containerd changes). If you reinstall MicroK8s or recreate the cluster, you'll be able to restore GPU support in minutes instead of repeating the entire debugging process.
